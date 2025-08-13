@@ -9,22 +9,24 @@ import (
 	"github.com/microsoft/typescript-go/internal/ast"
 	"github.com/microsoft/typescript-go/internal/collections"
 	"github.com/microsoft/typescript-go/internal/core"
+	"github.com/microsoft/typescript-go/internal/scanner"
 )
 
 // Stores side-table information used during transformation that can be read by the printer to customize emit
 //
 // NOTE: EmitContext is not guaranteed to be thread-safe.
 type EmitContext struct {
-	Factory       *NodeFactory // Required. The NodeFactory to use to create new nodes
-	autoGenerate  map[*ast.MemberName]*AutoGenerateInfo
-	textSource    map[*ast.StringLiteralNode]*ast.Node
-	original      map[*ast.Node]*ast.Node
-	emitNodes     core.LinkStore[*ast.Node, emitNode]
-	assignedName  map[*ast.Node]*ast.Expression
-	classThis     map[*ast.Node]*ast.IdentifierNode
-	varScopeStack core.Stack[*varScope]
-	letScopeStack core.Stack[*varScope]
-	emitHelpers   collections.OrderedSet[*EmitHelper]
+	Factory         *NodeFactory // Required. The NodeFactory to use to create new nodes
+	autoGenerate    map[*ast.MemberName]*AutoGenerateInfo
+	textSource      map[*ast.StringLiteralNode]*ast.Node
+	original        map[*ast.Node]*ast.Node
+	emitNodes       core.LinkStore[*ast.Node, emitNode]
+	assignedName    map[*ast.Node]*ast.Expression
+	classThis       map[*ast.Node]*ast.IdentifierNode
+	varScopeStack   core.Stack[*varScope]
+	letScopeStack   core.Stack[*varScope]
+	classScopeStack core.Stack[*classScope]
+	emitHelpers     collections.OrderedSet[*EmitHelper]
 }
 
 type environmentFlags int
@@ -154,6 +156,29 @@ func (c *EmitContext) EndAndMergeVariableEnvironment(statements []*ast.Statement
 
 func (c *EmitContext) endAndMergeVariableEnvironment(statements []*ast.Statement) ([]*ast.Statement, bool) {
 	return c.mergeEnvironment(statements, c.EndVariableEnvironment())
+}
+
+// NOTE: This is the new implementation of `ClassLexicalEnvironment` in Strada
+type classScope struct {
+	facts ClassFacts
+	// Used for brand checks on static members, and `this` references in static initializers
+	classConstructor *ast.IdentifierNode
+	classThis        *ast.IdentifierNode
+	// Used for `super` references in static initializers.
+	superClassReference *ast.IdentifierNode
+
+	classContainer *ast.ClassLikeDeclaration
+	className      *ast.Node // used for prefixing generated variable names
+	weakSetName    *ast.Node // used for brand check on private methods
+
+	// A mapping of generated private names to information needed for transformation.
+	generatedIdentifiers map[*ast.Node]PrivateIdentifierInfo
+	// A mapping of private names to information needed for transformation.
+	identifiers map[string]PrivateIdentifierInfo
+
+	// Tracks what computed name expressions originating from elided names must be inlined
+	// at the next execution site, in document order
+	pendingExpressions []*ast.Expression
 }
 
 // Adds a `var` declaration to the current VariableEnvironment
@@ -365,6 +390,68 @@ func (c *EmitContext) isHoistedVariableStatement(node *ast.Statement) bool {
 	return c.isCustomPrologue(node) &&
 		ast.IsVariableStatement(node) &&
 		core.Every(node.AsVariableStatement().DeclarationList.AsVariableDeclarationList().Declarations.Nodes, isHoistedVariable)
+}
+
+func (c *EmitContext) StartClassLexicalEnvironment(node *ast.ClassLikeDeclaration) {
+
+	// classContainer
+	classContainer := node
+
+	// className
+	var className *ast.Node
+	name := ast.GetNameOfDeclaration(node)
+	if name != nil && ast.IsIdentifier(name) {
+		className = name
+	} else {
+		assignedName := c.AssignedName(node)
+		if assignedName != nil {
+			if ast.IsStringLiteral(assignedName) {
+				// If the class name was assigned from a string literal based on an Identifier, use the Identifier
+				// as the prefix.
+				if textSourceNode := c.TextSource(assignedName); textSourceNode != nil && ast.IsIdentifier(textSourceNode) {
+					className = textSourceNode
+				} else if scanner.IsIdentifierText(assignedName.Text(), core.LanguageVariantStandard) {
+					// If the class name was assigned from a string literal that is a valid identifier, create an
+					// identifier from it.
+					prefixName := c.Factory.NewIdentifier(assignedName.Text())
+					className = prefixName
+				}
+			}
+		}
+	}
+
+	// privateInstanceMethodsAndAccessors := getPrivateInstanceMethodsAndAccessors(node.AsNode())
+	// if len(privateInstanceMethodsAndAccessors) > 0 {
+	// 	// !!! tx.getPrivateEnvironment().WeakSetName = tx.NewHoistedVariableForClass("instances", privateInstanceMethodsAndAccessors[0])
+	// 	tx.getPrivateEnvironment().WeakSetName = tx.Factory().NewUniqueName("instance")
+	// }
+
+	// facts := getClassFacts(tx.EmitContext(), node.AsNode())
+	// tx.getClassLexicalEnvironment().facts = facts
+
+	// if facts&ClassFactsNeedsSubstitutionForThisInClassStaticField != 0 {
+	// 	tx.enableSubstitutionForClassStaticThisOrSuperReference()
+	// }
+
+	c.classScopeStack.Push(&classScope{
+		facts:          ClassFactsNone,
+		classContainer: classContainer,
+		className:      className,
+	})
+}
+
+func (c *EmitContext) EndClassLexicalEnvironment() {
+	c.classScopeStack.Pop()
+}
+
+func (c *EmitContext) GetClassContainer() *ast.ClassLikeDeclaration {
+	scope := c.classScopeStack.Peek()
+	return scope.classContainer
+}
+
+func (c *EmitContext) GetClassFacts() ClassFacts {
+	scope := c.classScopeStack.Peek()
+	return scope.facts
 }
 
 //
@@ -881,6 +968,89 @@ func (c *EmitContext) AddInitializationStatement(node *ast.Node) {
 	scope.initializationStatements = append(scope.initializationStatements, node)
 }
 
+func (c *EmitContext) AddPrivateIdentifierToEnvironment(node *ast.Node, name *ast.PrivateIdentifier) {
+	scope := c.classScopeStack.Peek()
+	scope.facts |= ClassFactsWillHoistInitializersToConstructor
+
+	previousInfo := c.GetPrivateIdentifierInfo(name.AsPrivateIdentifier())
+	isStatic := ast.HasStaticModifier(node)
+	isValid := (c.HasAutoGenerateInfo(name.AsNode()) || name.Text != "#constructor") && previousInfo == nil
+	if ast.IsAutoAccessorPropertyDeclaration(node) {
+		// !!!
+	} else if ast.IsPropertyDeclaration(node) {
+		if isStatic {
+			// !!!
+		} else {
+			className := scope.className
+			weakMapName := c.Factory.NewGeneratedNameForNodeEx(name.AsNode(), AutoGenerateOptions{
+				Prefix: "_" + className.Text() + "_",
+			})
+			c.AddVariableDeclaration(weakMapName)
+
+			c.setPrivateIdentifierInfo(name, NewPrivateIdentifierInstanceFieldInfo(
+				weakMapName.AsIdentifier(),
+				isValid,
+			))
+
+			scope.pendingExpressions = append(
+				[]*ast.Expression{
+					c.Factory.NewAssignmentExpression(
+						weakMapName,
+						c.Factory.NewNewExpression(
+							c.Factory.NewIdentifier("WeakMap"),
+							nil, /*typeArguments*/
+							&ast.NodeList{},
+						),
+					),
+				},
+				scope.pendingExpressions...,
+			)
+		}
+	} else if ast.IsMethodDeclaration(node) {
+		// !!!
+	} else if ast.IsGetAccessorDeclaration(node) {
+		// !!!
+	} else if ast.IsSetAccessorDeclaration(node) {
+		// !!!
+	}
+}
+
+func (c *EmitContext) setPrivateIdentifierInfo(name *ast.PrivateIdentifier, info PrivateIdentifierInfo) {
+	scope := c.classScopeStack.Peek()
+	if c.HasAutoGenerateInfo(name.AsNode()) {
+		if scope.generatedIdentifiers == nil {
+			scope.generatedIdentifiers = make(map[*ast.Node]PrivateIdentifierInfo)
+		}
+		scope.generatedIdentifiers[c.GetNodeForGeneratedName(name.AsNode())] = info
+	} else {
+		if scope.identifiers == nil {
+			scope.identifiers = make(map[string]PrivateIdentifierInfo)
+		}
+		scope.identifiers[name.Text] = info
+	}
+}
+
+func (c *EmitContext) GetPrivateIdentifierInfo(name *ast.PrivateIdentifier) PrivateIdentifierInfo {
+	scope := c.classScopeStack.Peek()
+	if c.HasAutoGenerateInfo(name.AsNode()) {
+		if scope.generatedIdentifiers == nil {
+			return nil
+		} else {
+			return scope.generatedIdentifiers[c.GetNodeForGeneratedName(name.AsNode())]
+		}
+	} else {
+		if scope.identifiers == nil {
+			return nil
+		}
+		return scope.identifiers[name.Text]
+	}
+}
+
+func (c *EmitContext) GetPendingExpressions() []*ast.Expression {
+	scope := c.classScopeStack.Peek()
+	return scope.pendingExpressions
+}
+
 func (c *EmitContext) VisitFunctionBody(node *ast.BlockOrExpression, visitor *ast.NodeVisitor) *ast.BlockOrExpression {
 	// !!! c.resumeVariableEnvironment()
 	updated := visitor.VisitNode(node)
@@ -929,3 +1099,14 @@ func (c *EmitContext) VisitIterationBody(body *ast.Statement, visitor *ast.NodeV
 
 	return updated
 }
+
+// func getPrivateInstanceMethodsAndAccessors(node *ast.ClassLikeDeclaration) []*ast.Node {
+// 	return core.Filter(node.Members(), isNonStaticMethodOrAccessorWithPrivateName)
+// }
+
+// /**
+//  * Gets a value indicating whether a class element is a private instance method or accessor.
+//  */
+// func isNonStaticMethodOrAccessorWithPrivateName(classMemberNode *ast.Node) bool {
+// 	return !ast.IsStatic(classMemberNode) && (ast.IsMethodOrAccessor(classMemberNode) || ast.IsAutoAccessorPropertyDeclaration(classMemberNode)) && ast.IsPrivateIdentifier(classMemberNode.Name())
+// }

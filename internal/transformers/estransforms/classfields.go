@@ -104,6 +104,10 @@ func (tx *classFieldsTransformer) PrependPendingExpressions(expressions ...*ast.
 }
 
 func (tx *classFieldsTransformer) visit(node *ast.Node) *ast.Node {
+	return node
+}
+
+func (tx *classFieldsTransformer) _visit(node *ast.Node) *ast.Node {
 	if node == nil {
 		return nil
 	}
@@ -1335,17 +1339,6 @@ func (tx *classFieldsTransformer) setPrivateIdentifierInfo(name *ast.PrivateIden
 		}
 		privateEnv.Identifiers[name.Text] = info
 	}
-}
-
-/**
- * Gets a value indicating whether a class element is a private instance method or accessor.
- */
-func isNonStaticMethodOrAccessorWithPrivateName(classMemberNode *ast.Node) bool {
-	return !ast.IsStatic(classMemberNode) && (ast.IsMethodOrAccessor(classMemberNode) || ast.IsAutoAccessorPropertyDeclaration(classMemberNode)) && ast.IsPrivateIdentifier(classMemberNode.Name())
-}
-
-func getPrivateInstanceMethodsAndAccessors(node *ast.ClassLikeDeclaration) []*ast.Node {
-	return core.Filter(node.Members(), isNonStaticMethodOrAccessorWithPrivateName)
 }
 
 func getClassFacts(emitContext *printer.EmitContext, node *ast.ClassLikeDeclaration) ClassFacts {

@@ -103,12 +103,12 @@ func (p *PrivateIdentifierMethodInfo) BrandCheckIdentifier() *ast.Identifier {
 	return p.PrivateIdentifierInfoBase.brandCheckIdentifier
 }
 
-func NewPrivateIdentifierMethodInfo(brandCheckIdentifier *ast.Identifier, methodName *ast.Identifier, isValid bool, isStatc bool) *PrivateIdentifierMethodInfo {
+func NewPrivateIdentifierMethodInfo(brandCheckIdentifier *ast.Identifier, methodName *ast.Identifier, isValid bool, isStatic bool) *PrivateIdentifierMethodInfo {
 	return &PrivateIdentifierMethodInfo{
 		kind: PrivateIdentifierKindMethod,
 		PrivateIdentifierInfoBase: PrivateIdentifierInfoBase{
 			brandCheckIdentifier: brandCheckIdentifier,
-			isStatic:             isStatc,
+			isStatic:             isStatic,
 			isValid:              isValid,
 		},
 		MethodName: methodName,
