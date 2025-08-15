@@ -445,6 +445,9 @@ func (c *EmitContext) EndClassLexicalEnvironment() {
 }
 
 func (c *EmitContext) GetClassContainer() *ast.ClassLikeDeclaration {
+	if c.classScopeStack.Len() == 0 {
+		return nil
+	}
 	scope := c.classScopeStack.Peek()
 	return scope.classContainer
 }
@@ -993,17 +996,15 @@ func (c *EmitContext) AddPrivateIdentifierToEnvironment(node *ast.Node, name *as
 			))
 
 			scope.pendingExpressions = append(
-				[]*ast.Expression{
-					c.Factory.NewAssignmentExpression(
-						weakMapName,
-						c.Factory.NewNewExpression(
-							c.Factory.NewIdentifier("WeakMap"),
-							nil, /*typeArguments*/
-							&ast.NodeList{},
-						),
+				scope.pendingExpressions,
+				c.Factory.NewAssignmentExpression(
+					weakMapName,
+					c.Factory.NewNewExpression(
+						c.Factory.NewIdentifier("WeakMap"),
+						nil, /*typeArguments*/
+						&ast.NodeList{},
 					),
-				},
-				scope.pendingExpressions...,
+				),
 			)
 		}
 	} else if ast.IsMethodDeclaration(node) {
@@ -1030,7 +1031,11 @@ func (c *EmitContext) setPrivateIdentifierInfo(name *ast.PrivateIdentifier, info
 	}
 }
 
+// NOTE: This is the equivalent of `accessPrivateIdentifier` in Strada
 func (c *EmitContext) GetPrivateIdentifierInfo(name *ast.PrivateIdentifier) PrivateIdentifierInfo {
+	if c.classScopeStack.Len() == 0 {
+		return nil
+	}
 	scope := c.classScopeStack.Peek()
 	if c.HasAutoGenerateInfo(name.AsNode()) {
 		if scope.generatedIdentifiers == nil {
